@@ -1,0 +1,357 @@
+#!/usr/bin/env raku
+
+use v6.d;
+use OpenAPI::Model;
+use JSON::Fast;
+use Template::Mustache;
+use Cro::WebApp::Template::Repository;
+use PathTools;
+
+my $version = '0.1.1';
+
+my $apij = from-json $*PROGRAM.add('../api.json').resolve.slurp;
+my $api = OpenAPI::Model.from-json($*PROGRAM.add('../api.json').resolve.slurp);
+
+my $template-repo = get-template-repository;
+$template-repo.add-location($*PROGRAM.add('../templates').resolve);
+
+my $static-file-dir = $*PROGRAM.add('../static/').resolve;
+my $output-dir      = $*PROGRAM.add('../../gen/').resolve;
+my $output-lib-dir  = $output-dir.add('lib/').resolve;
+
+class RakuParam {
+    has Str $.name;
+    has Str $.api-name;
+    has Str $.type;
+    has Str $.sigil = '$';
+    has Bool $.required;
+    has Bool $.in-data;
+}
+
+class RakuMethod {
+    has Str $.name;
+    has RakuParam @.params;
+    has RakuParam @.data-params;
+    has Str @param-validations;
+    has Str $.request-path;
+    has Str $.request-method;
+}
+
+class RakuSubset {
+    has $.name;
+    has @.values;
+    method junction() {
+        @!values.map({"'" ~ $_ ~ "'"}).join('|')
+    }
+    method alt-text() {
+        my @vals = @!values.map({'"' ~ $_ ~ '"'});
+        my $text;
+        if @vals.elems == 1 {
+           $text = @vals[0];
+        }
+        else {
+            $text = @vals[0..*-2].join(', ');
+            $text ~= ' or ' ~ @vals[*-1];
+        }
+        $text
+    }
+}
+
+class RakuClass {
+    has RakuSubset @.subsets;
+    has RakuMethod @.methods;
+    has Str @.bases;
+    has Str $.name;
+    has Str $.class-method-name;
+    has Str @.pods;
+}
+
+my %classes;
+for $api.paths -> $paths {
+    for flat $paths.kv -> Str $path-template , $path {
+        for <get put post delete options head patch trace> -> $method {
+            with $path."$method"() -> $operation {
+                my ($class-name, $class-method-name) = operation-class($operation,$path-template,$method);
+                my $method-name = method-name($operation);
+                my $request-path = fix-path($path-template);
+                my (@params, @subsets) := gen-params $operation.parameters, $class-name, $method-name;
+                if have-requestBody($operation) {
+                    my (@body-params, @body-subsets) := gen-body-params $operation.request-body.content<application/json>.schema, $class-name, $method-name;
+                    @params.append(@body-params);
+                    @subsets.append(@body-subsets);
+                }
+                my @params-decl = @params>>.&param-decl;
+                my $rmethod = RakuMethod.new(
+                        :name($method-name),
+                        :params(@params.sort(!*.required)),
+                        :data-params(@params.grep(*.in-data)),
+                        :$request-path,
+                        :request-method($method.uc));
+                my $pod = "=head2 { $operation.summary }\n=begin para\nSee L<{ $operation.operation-id }|{ $operation.external-docs.url // "https://docs.github.com/en/rest/reference/{ $operation.operation-id.split("/")[0] }" }> \n=end para\n";
+                $pod ~= '=begin code' ~ "\n";
+                $pod ~= "\t" ~ "$class-name." ~ $method-name ~ '( ' ~ @params-decl.join(', ') ~ ' )' ~ "\n";
+                $pod ~= '=end code' ~ "\n";
+                unless %classes{$class-name}:exists {
+                    %classes{$class-name} = RakuClass.new(
+                            :name($class-name),
+                            :$class-method-name,
+                            :bases<WebService::GitHub::Role>,
+                        );
+                }
+                %classes{$class-name}.pods.push: $pod;
+                %classes{$class-name}.methods.push: $rmethod;
+                %classes{$class-name}.subsets.append: @subsets;
+            }
+        }
+    }
+}
+
+rm($output-dir, :r);
+$output-dir.mkdir;
+
+for %classes.values -> $class {
+    my $class-path = get-class-path($class.name);
+    my $pod-path = get-class-path($class.name,'pod6');
+    my $code = class-code($class);
+    my $pod;
+    $pod ~= '=begin pod' ~ "\n";
+    $pod ~= '=head1 ' ~ $class.name ~ "\n";
+    $pod ~= $class.pods[*].join("\n\n");
+    $pod ~= '=end pod' ~ "\n";
+    $class-path.parent.mkdir unless $class-path.parent.e;
+    $class-path.spurt($code);
+    $pod-path.spurt($pod);
+}
+say "Generated {%classes.elems} Classes";
+
+{
+    my $code = github-code(%classes.values);
+    my $class-path = get-class-path('WebService::GitHub');
+    $class-path.spurt($code);
+}
+say "Generated WebService::GitHub entry point class";
+
+{
+    my @meta6-classes;
+    for %classes.values {
+        @meta6-classes.push: %(
+            module => $_.name,
+            path   => get-class-path($_.name).relative($output-dir),
+        )
+    }
+    my $code = meta6-code(@meta6-classes, $version);
+    my $path = $output-dir.IO.add('META6.json');
+    $path.spurt($code);
+}
+say "Generated META6.json";
+
+{
+	my @todo = $static-file-dir.IO;
+    while @todo {
+        for @todo.pop.dir -> $path {
+            if $path.d {
+                @todo.push: $path;
+			}
+            else {
+                my $out-path = $output-dir.IO.add($path.relative($static-file-dir));
+                $out-path.parent.mkdir unless $out-path.parent.e;
+                $path.copy($out-path);
+            }
+        }
+    }
+}
+say "Static files are copied over";
+
+sub get-raku-type($param, $class, $method) {
+    if $param.schema<type>:!exists {
+        'Any', '$'
+    }
+    else {
+        given $param.schema<type> {
+            when 'integer' {
+                'Int(Str)', '$';
+            }
+            when 'string' {
+                if $param.schema<enum>:exists {
+                    my $name = "{$class}::" ~ method-to-class-name($method) ~ method-to-class-name($param.name.split('_').map(*.tc).join);
+                    $name, '$', RakuSubset.new:
+                        name => $name,
+                        values => |$param.schema<enum>.grep(* ne '');
+                }
+                else {
+                    'Str', '$'
+                }
+            }
+            when 'boolean' {
+                'Bool', '$'
+            }
+            when 'number' {
+                'Num', '$'
+            }
+            when 'array' {
+                'List', '@'
+            }
+            when 'object' {
+                'Hash', '%'
+            }
+            default {
+                'Any', '$'
+            }
+        }
+    }
+}
+
+sub get-raku-type-for-body-param($name, %config, $class, $method) {
+    if %config<type>:!exists {
+        'Any', '$'
+    }
+    else {
+        given %config<type> {
+            when 'integer' {
+                'Int(Str)', '$';
+            }
+            when 'string' {
+                if %config<enum>:exists {
+                    my $full-name = "{$class}::" ~ method-to-class-name($method) ~ method-to-class-name($name.split('_').map(*.tc).join);
+                    $full-name, '$', RakuSubset.new:
+                        name => $full-name,
+                        values => |%config<enum>.grep(* ne '');
+                }
+                else {
+                    'Str', '$'
+                }
+            }
+            when 'boolean' {
+                'Bool', '$'
+            }
+            when 'number' {
+                'Num', '$'
+            }
+            when 'array' {
+                'List', '@'
+            }
+            when 'object' {
+                'Hash', '%'
+            }
+            default {
+                'Any', '$'
+            }
+        }
+    }
+}
+
+sub method-to-class-name($mname) {
+    $mname.split('-').map(*.tc).join
+}
+
+sub gen-params(@params, $class, $method) {
+    my @res-params;
+    my @subsets;
+    for @params -> $param {
+        my $name = $param.name.trans('_' => '-');
+        my ($type,$sigil,$subset) = get-raku-type($param, $class, $method);
+        @res-params.push: RakuParam.new(
+                :$name,
+                :api-name($param.name),
+                :$type,
+                :required($param.required),
+                :$sigil,
+                :in-data($param.in eq 'query')
+                );
+        @subsets.push($subset) if $subset;
+    }
+    @res-params, @subsets
+}
+
+sub gen-body-params(%schema, $class, $method) {
+    my @res-params;
+    my @subsets;
+    for %schema<properties>.kv -> $api-name, %config {
+        my $name = $api-name.trans('_' => '-');
+        my ($type,$sigil,$subset) = get-raku-type-for-body-param($api-name, %config, $class, $method);
+        @res-params.push: RakuParam.new(
+                :$name,
+                :$api-name,
+                :$type,
+                :required($api-name (elem) %schema<required>),
+                :$sigil,
+                :in-data
+                );
+        @subsets.push($subset) if $subset;
+    }
+    @res-params, @subsets
+}
+
+sub fix-path(Str $path is copy) {
+    $path.match(/['{'(\w+)'}']+/, :global).map(-> $match {
+        $path .= subst($match.Str, '$' ~ $match[0].Str.trans('_' => '-'))
+    });
+    $path;
+}
+
+sub have-requestBody($operation) {
+    $operation.request-body.content<application/json>.defined;
+}
+
+sub method-name($operation) {
+    $operation.operation-id.split("/")[*- 1]
+}
+
+sub get-class-path($class-name,$ext = 'rakumod') {
+    my $path;
+    if $class-name.index('::') {
+        my $parts = $class-name.split('::');
+        $path = $output-lib-dir.IO.add($parts[0 .. *- 2].join('/')).add("$parts[*- 1].$ext");
+    } else {
+        $path = $output-lib-dir.IO.add("$class-name.$ext");
+    }
+    $path.resolve
+}
+
+sub operation-class($operation,$path-template,$method) {
+    my $class-name;
+    my $subcategory = $apij<paths>{$path-template}{$method}<x-github><subcategory> // '';
+    my $category = $apij<paths>{$path-template}{$method}<x-github><category>;
+    if $subcategory && $subcategory ne $category {
+        $class-name = ($category, $subcategory)>>.&category-class.join('::');
+    } else {
+        $class-name = category-class($category);
+    }
+    my $class-method = $class-name.trans(['::'] => ['-']).lc;
+    'WebService::GitHub::' ~ $class-name, $class-method
+}
+
+sub category-class($category) {
+    $category.split("/")[0].split("-")>>.wordcase.join;
+}
+
+sub param-decl(RakuParam $param) {
+    (await $template-repo.resolve('param.crotmp')).render({ :$param })
+}
+
+sub class-code(RakuClass $class) {
+    (await $template-repo.resolve('class.crotmp')).render({ :$class })
+}
+
+sub github-code(@classes) {
+    (await $template-repo.resolve('GitHub.crotmp')).render({ :@classes })
+}
+
+sub meta6-code(@classes, $version) {
+    (await $template-repo.resolve('META6.json.crotmp')).render({ meta6 => {
+        :@classes,
+        :$version
+    }})
+}
+
+sub subset-code(RakuSubset $subset) {
+    (await $template-repo.resolve('subset.crotmp')).render({ :$subset })
+}
+
+sub get-subname($param) {
+    $param.name.split("_")>>.wordcase.join
+}
+
+sub get-param-name($param) {
+    $param.name.trans('_' => '-')
+}

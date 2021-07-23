@@ -1,7 +1,12 @@
 <:use 'method.crotmp'>
+<:use 'subset.crotmp'>
 <:sub rclass($class)>
+<?$class.subsets>use Subset::Helper;</?>
 <@$class.bases: $base>
 use <$base>;
+</@>
+<@$class.subsets: $subset>
+<&subset($subset)>
 </@>
 
 class <$class.name>  {
@@ -13,5 +18,4 @@ class <$class.name>  {
     </@>
 }
 </:>
-
 <&rclass(.class)>
